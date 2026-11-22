@@ -15,7 +15,7 @@ from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from openai import OpenAI
+from ..utils.llm_client import ContextOverflowError, LLMClient
 
 from ..config import Config
 from ..utils.logger import get_logger
@@ -192,10 +192,9 @@ class OasisProfileGenerator:
         if not self.api_key:
             raise ValueError("LLM_API_KEY not configured")
 
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url
-        )
+        # Transport (OpenAI /v1 or Ollama native) and num_ctx come from Config via LLMClient
+        self.llm = LLMClient(api_key=self.api_key, base_url=self.base_url,
+                             model=self.model_name, operation="profile")
 
         # GraphStorage for hybrid search enrichment
         self.storage = storage
@@ -471,21 +470,21 @@ class OasisProfileGenerator:
 
         for attempt in range(max_attempts):
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
+                content = self.llm.complete(
                     messages=[
                         {"role": "system", "content": self._get_system_prompt(is_individual)},
                         {"role": "user", "content": prompt}
                     ],
                     response_format={"type": "json_object"},
-                    temperature=0.7 - (attempt * 0.1)  # Lower temperature with each retry
-                    # Don't set max_tokens, let LLM generate freely
+                    temperature=0.7 - (attempt * 0.1),  # Lower temperature with each retry
+                    max_tokens=4096,  # output reserve (needed for the num_ctx preflight); profiles are ~1-2k tokens
+                    # Structured JSON: thinking adds little and its tokens count against max_tokens
+                    # (with thinking on, 2 of 7 profiles were cut at 4096 in the GGUF lab run)
+                    disable_thinking=True,
                 )
 
-                content = response.choices[0].message.content
-
                 # Check if output was truncated (finish_reason is not 'stop')
-                finish_reason = response.choices[0].finish_reason
+                finish_reason = self.llm.last_finish_reason
                 if finish_reason == 'length':
                     logger.warning(f"LLM output truncated (attempt {attempt+1}), attempting to fix...")
                     content = self._fix_truncated_json(content)
@@ -513,6 +512,8 @@ class OasisProfileGenerator:
 
                     last_error = je
 
+            except ContextOverflowError:
+                raise  # visible failure; must not fall back to a rule-based profile silently
             except Exception as e:
                 logger.warning(f"LLM call failed (attempt {attempt+1}): {str(e)[:80]}")
                 last_error = e
@@ -876,6 +877,8 @@ Important:
 
                 return idx, profile, None
 
+            except ContextOverflowError:
+                raise  # surfaced to the prepare task instead of a silent fallback persona
             except Exception as e:
                 logger.error(f"Failed to generate persona for entity {entity.name}: {str(e)}")
                 # Create a fallback profile
@@ -931,6 +934,8 @@ Important:
                     else:
                         logger.info(f"[{current}/{total}] Successfully generated persona: {entity.name} ({entity_type})")
 
+                except ContextOverflowError:
+                    raise
                 except Exception as e:
                     logger.error(f"Exception occurred while processing entity {entity.name}: {str(e)}")
                     with lock:

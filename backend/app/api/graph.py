@@ -454,6 +454,17 @@ def build_graph():
                 )
                 graph_data = builder.get_graph_data(graph_id)
 
+                # Technical NER/embedding errors already failed the task above. Reaching here
+                # with 0 nodes means every chunk was processed and nothing matched the ontology:
+                # a legitimate (if useless) result, reported explicitly rather than as a failure.
+                empty_warning = None
+                if graph_data.get("node_count", 0) == 0:
+                    empty_warning = (
+                        f"No entities matching the ontology were found in {total_chunks} chunk(s) "
+                        f"(model {Config.LLM_MODEL_NAME}). The document may not contain applicable information."
+                    )
+                    build_logger.warning(f"[{task_id}] {empty_warning}")
+
                 # Update project status
                 project.status = ProjectStatus.GRAPH_COMPLETED
                 ProjectManager.save_project(project)
@@ -466,14 +477,15 @@ def build_graph():
                 task_manager.update_task(
                     task_id,
                     status=TaskStatus.COMPLETED,
-                    message="Graph build completed",
+                    message=f"Graph build completed with warning: {empty_warning}" if empty_warning else "Graph build completed",
                     progress=100,
                     result={
                         "project_id": project_id,
                         "graph_id": graph_id,
                         "node_count": node_count,
                         "edge_count": edge_count,
-                        "chunk_count": total_chunks
+                        "chunk_count": total_chunks,
+                        "warning": empty_warning,
                     }
                 )
 

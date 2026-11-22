@@ -723,9 +723,9 @@ Each reply you can only do one of two things (cannot do both):
 
 Option A - Call Tool:
 Output your thinking, then call a tool using the following format:
-<tool_call>
+<tool>
 {{"name": "Tool Name", "parameters": {{"parameter_name": "parameter_value"}}}}
-</tool_call>
+</tool>
 The system will execute the tool and return the result to you. You don't need to and cannot write tool return results yourself.
 
 Option B - Output Final Content:
@@ -846,9 +846,9 @@ Prediction Condition: {simulation_requirement}
 {tools_description}
 
 [Tool Call Format]
-<tool_call>
+<tool>
 {{"name": "Tool Name", "parameters": {{"parameter_name": "parameter_value"}}}}
-</tool_call>
+</tool>
 
 [Answer Style]
 - Concise and direct, don't write lengthy passages
@@ -905,7 +905,7 @@ class ReportAgent:
         self.simulation_id = simulation_id
         self.simulation_requirement = simulation_requirement
 
-        self.llm = llm_client or LLMClient()
+        self.llm = llm_client or LLMClient(operation="report")  # chat() overrides with operation="chat"
         if graph_tools is None:
             raise ValueError(
                 "graph_tools (GraphToolsService) is required. "
@@ -1076,16 +1076,21 @@ class ReportAgent:
         Parse tool calls from LLM response
 
         Supported formats (in priority order):
-        1. <tool_call>{"name": "tool_name", "parameters": {...}}</tool_call>
+        1. <tool>{"name": "tool_name", "parameters": {...}}</tool>
+           (legacy <tool_call>...</tool_call> is also accepted)
         2. Raw JSON (the entire response or a single line is a tool call JSON)
+
+        The prompts ask for <tool>, not <tool_call>: on Ollama, Qwen models' native
+        tool-call parser intercepts a literal <tool_call> in plain text and the request
+        fails with HTTP 500 "EOF".
         """
         tool_calls = []
 
         # Format 1: XML-style (standard format)
-        xml_pattern = r'<tool_call>\s*(\{.*?\})\s*</tool_call>'
+        xml_pattern = r'<(tool_call|tool)>\s*(\{.*?\})\s*</\1>'
         for match in re.finditer(xml_pattern, response, re.DOTALL):
             try:
-                call_data = json.loads(match.group(1))
+                call_data = json.loads(match.group(2))
                 tool_calls.append(call_data)
             except json.JSONDecodeError:
                 pass
@@ -1311,11 +1316,13 @@ class ReportAgent:
             response = self.llm.chat(
                 messages=messages,
                 temperature=0.5,
-                max_tokens=4096
+                # Thinking tokens count against this budget on Ollama; 4096 left some
+                # sections with an empty answer (all budget spent reasoning)
+                max_tokens=8192
             )
 
-            # Check if LLM return is None (API exception or empty content)
-            if response is None:
+            # Check if LLM return is None or empty (API exception, or output budget spent on thinking)
+            if response is None or not response.strip():
                 logger.warning(f"Section {section.title} round {iteration + 1} iteration: LLM returned None")
                 # If there are more iterations, add message and retry
                 if iteration < max_iterations - 1:
@@ -1348,8 +1355,8 @@ class ReportAgent:
                         "content": (
                             "[Format Error] You cannot include both tool calls and Final Answer in one reply.\n"
                             "Each reply can only do one of the following:\n"
-                            "- Call a tool (output a <tool_call> block, don't write Final Answer)\n"
-                            "- Output final content (starting with 'Final Answer:', don't include <tool_call>)\n"
+                            "- Call a tool (output a <tool> block, don't write Final Answer)\n"
+                            "- Output final content (starting with 'Final Answer:', don't include <tool>)\n"
                             "Please reply again and only do one of these."
                         ),
                     })
@@ -1360,9 +1367,9 @@ class ReportAgent:
                         f"Section {section.title}: consecutive {conflict_retries} conflicts，"
                         "downgraded to truncate and execute first tool call"
                     )
-                    first_tool_end = response.find('</tool_call>')
-                    if first_tool_end != -1:
-                        response = response[:first_tool_end + len('</tool_call>')]
+                    first_tool_end = re.search(r'</(?:tool_call|tool)>', response)
+                    if first_tool_end:
+                        response = response[:first_tool_end.end()]
                         tool_calls = self._parse_tool_calls(response)
                         has_tool_calls = bool(tool_calls)
                     has_final_answer = False
@@ -1514,13 +1521,13 @@ class ReportAgent:
         response = self.llm.chat(
             messages=messages,
             temperature=0.5,
-            max_tokens=4096
+            max_tokens=8192
         )
 
         # Check forceconclusion when LLM return is None
-        if response is None:
-            final_answer = f"(This section generation failed: LLM returned empty response, please retry later)"
-            final_answer = f"(ThisSectiongeneratefailed: LLM returnedemptyresponse, pleaselaterretry)"
+        if response is None or not response.strip():
+            final_answer = "(This section generation failed: LLM returned empty response, please retry later)"
+            logger.error(f"Section {section.title}: empty response after forced conclusion")
         elif "Final Answer:" in response:
             final_answer = response.split("Final Answer:")[-1].strip()
         else:
@@ -1834,7 +1841,8 @@ class ReportAgent:
         for iteration in range(max_iterations):
             response = self.llm.chat(
                 messages=messages,
-                temperature=0.5
+                temperature=0.5,
+                operation="chat",
             )
             
             # parseTool call
@@ -1842,7 +1850,7 @@ class ReportAgent:
             
             if not tool_calls:
                 # noTool call，directlyReturnresponse
-                clean_response = re.sub(r'<tool_call>.*?</tool_call>', '', response, flags=re.DOTALL)
+                clean_response = re.sub(r'<(tool_call|tool)>.*?</\1>', '', response, flags=re.DOTALL)
                 clean_response = re.sub(r'\[TOOL_CALL\].*?\)', '', clean_response)
                 
                 return {
@@ -1874,11 +1882,12 @@ class ReportAgent:
         # Reachedmaximum iteration，Getfinalresponse
         final_response = self.llm.chat(
             messages=messages,
-            temperature=0.5
+            temperature=0.5,
+            operation="chat",
         )
         
         # cleanresponse
-        clean_response = re.sub(r'<tool_call>.*?</tool_call>', '', final_response, flags=re.DOTALL)
+        clean_response = re.sub(r'<(tool_call|tool)>.*?</\1>', '', final_response, flags=re.DOTALL)
         clean_response = re.sub(r'\[TOOL_CALL\].*?\)', '', clean_response)
         
         return {

@@ -6,17 +6,25 @@ services:
     container_name: mirofish-offline
     env_file:
       - .env
+    # Inside the container `localhost` is the container itself, so the host-oriented values in
+    # .env (NEO4J_URI=bolt://localhost:7687, EMBEDDING_BASE_URL=http://localhost:...) never connect.
+    # `environment` wins over `env_file`; LLM_BASE_URL is left to .env (it may be a LAN address).
+    environment:
+      - NEO4J_URI=bolt://neo4j:7687
+      - EMBEDDING_BASE_URL=http://host.docker.internal:11434/v1
     ports:
       - "3000:3000"
       - "5001:5001"
     restart: unless-stopped
+    # Lets the container reach an LLM server on the host (omlx/Ollama) as host.docker.internal.
+    # Built into Docker Desktop (macOS/Windows); this mapping makes it work on Linux too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./backend/uploads:/app/backend/uploads
     depends_on:
       neo4j:
         condition: service_healthy
-      ollama:
-        condition: service_started
 
   neo4j:
     image: neo4j:5.18-community
@@ -40,23 +48,6 @@ services:
       retries: 10
       start_period: 30s
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: mirofish-ollama
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
 volumes:
   neo4j_data:
   neo4j_logs:
-  ollama_data:

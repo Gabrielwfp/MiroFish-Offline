@@ -16,7 +16,7 @@ from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 
-from openai import OpenAI
+from ..utils.llm_client import ContextOverflowError, LLMClient
 
 from ..config import Config
 from ..utils.logger import get_logger
@@ -234,11 +234,10 @@ class SimulationConfigGenerator:
         if not self.api_key:
             raise ValueError("LLM_API_KEY not configured")
 
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url
-        )
-    
+        # Transport (OpenAI /v1 or Ollama native) and num_ctx come from Config via LLMClient
+        self.llm = LLMClient(api_key=self.api_key, base_url=self.base_url,
+                             model=self.model_name, operation="sim_config")
+
     def generate_config(
         self,
         simulation_id: str,
@@ -439,19 +438,17 @@ class SimulationConfigGenerator:
 
         for attempt in range(max_attempts):
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model_name,
+                content = self.llm.complete(
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": prompt}
                     ],
                     response_format={"type": "json_object"},
-                    temperature=0.7 - (attempt * 0.1)  # Lower temperature with each retry
-                    # Don't set max_tokens, let LLM generate freely
+                    temperature=0.7 - (attempt * 0.1),  # Lower temperature with each retry
+                    max_tokens=8192,  # output reserve for the num_ctx preflight (batched agent configs can be long)
+                    disable_thinking=True,  # structured JSON; thinking tokens would count against max_tokens
                 )
-
-                content = response.choices[0].message.content
-                finish_reason = response.choices[0].finish_reason
+                finish_reason = self.llm.last_finish_reason
 
                 # Check if output was truncated
                 if finish_reason == 'length':
@@ -471,6 +468,8 @@ class SimulationConfigGenerator:
 
                     last_error = e
 
+            except ContextOverflowError:
+                raise  # retrying cannot help; surfaced to the prepare task
             except Exception as e:
                 logger.warning(f"LLM call failed (attempt {attempt+1}): {str(e)[:80]}")
                 last_error = e
@@ -588,6 +587,8 @@ Field description:
 
         try:
             return self._call_llm_with_retry(prompt, system_prompt)
+        except ContextOverflowError:
+            raise
         except Exception as e:
             logger.warning(f"Time config LLM generation failed: {e}, using default configuration")
             return self._get_default_time_config(num_entities)
@@ -704,6 +705,8 @@ Return JSON format (no markdown):
 
         try:
             return self._call_llm_with_retry(prompt, system_prompt)
+        except ContextOverflowError:
+            raise
         except Exception as e:
             logger.warning(f"Event config LLM generation failed: {e}, using default configuration")
             return {
@@ -868,6 +871,8 @@ Return JSON format (no markdown):
         try:
             result = self._call_llm_with_retry(prompt, system_prompt)
             llm_configs = {cfg["agent_id"]: cfg for cfg in result.get("agent_configs", [])}
+        except ContextOverflowError:
+            raise
         except Exception as e:
             logger.warning(f"Agent config batch LLM generation failed: {e}, using rule-based generation")
             llm_configs = {}

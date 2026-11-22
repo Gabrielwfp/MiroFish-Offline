@@ -24,9 +24,9 @@ The [original MiroFish](https://github.com/666ghj/MiroFish) was built for the Ch
 | Original MiroFish | MiroFish-Offline |
 |---|---|
 | Chinese UI | **English UI** (1,000+ strings translated) |
-| Zep Cloud (graph memory) | **Neo4j Community Edition 5.15** |
-| DashScope / OpenAI API (LLM) | **Ollama** (qwen2.5, llama3, etc.) |
-| Zep Cloud embeddings | **nomic-embed-text** via Ollama |
+| Zep Cloud (graph memory) | **Neo4j Community Edition 5.18+** |
+| DashScope / OpenAI API (LLM) | **Ollama** (GGUF or MLX models) |
+| Zep Cloud embeddings | **qwen3-embedding:0.6b** via Ollama (1024d) |
 | Cloud API keys required | **Zero cloud dependencies** |
 
 ## Workflow
@@ -47,87 +47,89 @@ The [original MiroFish](https://github.com/666ghj/MiroFish) was built for the Ch
 
 ### Prerequisites
 
-- Docker & Docker Compose (recommended), **or**
-- Python 3.11+, Node.js 18+, Neo4j 5.15+, Ollama
+- **Ollama running natively on the host** (macOS app or `ollama serve`, port 11434), version 0.40+ (JSON-schema outputs). It is not a compose service.
+- Neo4j **5.18+** (relationship vector search). `docker compose` provides it.
+- Docker & Docker Compose (recommended), **or** Python **3.11 exactly** (`camel-oasis` requires `<3.12`), [uv](https://docs.astral.sh/uv/) and Node.js 18+.
 
-### Option A: Docker (easiest)
+### 1. Pull the models
 
 ```bash
-git clone https://github.com/nikmcfly/MiroFish-Offline.git
-cd MiroFish-Offline
-cp .env.example .env
+ollama pull qwen3-embedding:0.6b          # embeddings (1024d)
+ollama pull ornith-1.5:9b                 # chat / NER / agents (GGUF), or any other chat model
 
-# Start all services (Neo4j, Ollama, MiroFish)
-docker compose up -d
-
-# Pull the required models into Ollama
-docker exec mirofish-ollama ollama pull qwen2.5:32b
-docker exec mirofish-ollama ollama pull nomic-embed-text
+# Optional but recommended for the simulation: a derived model with a fixed context window
+printf 'FROM ornith-1.5:9b\nPARAMETER num_ctx 32768\n' > Modelfile
+ollama create ornith-1.5:9b-mirofish-ctx32k -f Modelfile
 ```
 
-Open `http://localhost:3000` — that's it.
-
-### Option B: Manual
-
-**1. Start Neo4j**
+### 2. Configure
 
 ```bash
-docker run -d --name neo4j \
-  -p 7474:7474 -p 7687:7687 \
-  -e NEO4J_AUTH=neo4j/mirofish \
-  neo4j:5.15-community
+cp .env.example .env     # then adjust models and URLs (see Configuration)
 ```
 
-**2. Start Ollama & pull models**
+### Option A: Docker
 
 ```bash
-ollama serve &
-ollama pull qwen2.5:32b      # LLM (or qwen2.5:14b for less VRAM)
-ollama pull nomic-embed-text  # Embeddings (768d)
-```
-
-**3. Configure & run backend**
-
-```bash
-cp .env.example .env
-# Edit .env if your Neo4j/Ollama are on non-default ports
-
-cd backend
-pip install -r requirements.txt
-python run.py
-```
-
-**4. Run frontend**
-
-```bash
-cd frontend
-npm install
-npm run dev
+docker compose up -d     # Neo4j + the MiroFish app
 ```
 
 Open `http://localhost:3000`.
 
-## Configuration
+Inside the app container `localhost` is the container itself. `docker-compose.yml` therefore overrides `NEO4J_URI` (`bolt://neo4j:7687`) and `EMBEDDING_BASE_URL` (`http://host.docker.internal:11434/v1`). `LLM_BASE_URL` and `OPENAI_API_BASE_URL` still come from your `.env`: use `http://host.docker.internal:11434/v1` (or a LAN address), never `localhost`.
 
-All settings are in `.env` (copy from `.env.example`):
+### Option B: Manual
 
 ```bash
-# LLM — points to local Ollama (OpenAI-compatible API)
+docker compose up -d neo4j          # or any Neo4j >= 5.18
+npm run setup:all                   # root + frontend deps, and `uv sync` in backend
+npm run dev                         # backend (Flask :5001) + frontend (Vite :3000)
+```
+
+Open `http://localhost:3000`. The backend must run on Python 3.11 (`backend/.python-version`); pass `--python 3.11` to `uv` if your default is newer.
+
+### Tests
+
+```bash
+cd backend && uv run --python 3.11 --with pytest python -m pytest tests -q
+```
+
+Mocked, no network or Ollama required.
+
+## Configuration
+
+All settings are in a single root `.env` (copy from `.env.example`, which documents every variable):
+
+```bash
+# LLM (chat) — Ollama's OpenAI-compatible API. The key is ignored but must be non-empty
 LLM_API_KEY=ollama
-LLM_BASE_URL=http://localhost:11434/v1
-LLM_MODEL_NAME=qwen2.5:32b
+LLM_BASE_URL=http://localhost:11434/v1        # Docker: http://host.docker.internal:11434/v1
+LLM_MODEL_NAME=ornith-1.5:9b-mirofish-ctx32k
 
 # Neo4j
-NEO4J_URI=bolt://localhost:7687
+NEO4J_URI=bolt://localhost:7687               # Docker: overridden by docker-compose.yml
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=mirofish
 
-# Embeddings
-EMBEDDING_MODEL=nomic-embed-text
-EMBEDDING_BASE_URL=http://localhost:11434
+# Embeddings (base URL must include /v1; independent from the chat settings)
+EMBEDDING_MODEL=qwen3-embedding:0.6b
+EMBEDDING_BASE_URL=http://localhost:11434/v1
+EMBEDDING_DIMENSIONS=1024                     # sizes the Neo4j vector indexes
 ```
 
-Works with any OpenAI-compatible API — swap Ollama for Claude, GPT, or any other provider by changing `LLM_BASE_URL` and `LLM_API_KEY`.
+Works with any OpenAI-compatible API by changing `LLM_BASE_URL` and `LLM_API_KEY`. Changing `EMBEDDING_DIMENSIONS` on an existing database requires dropping the `entity_embedding` / `fact_embedding` indexes and re-embedding.
+
+### Context window (`num_ctx`)
+
+| `LLM_API_MODE` | Transport | `num_ctx` |
+|---|---|---|
+| `openai` (default) | `/v1` | Not sent; Ollama uses its server default (`OLLAMA_CONTEXT_LENGTH`) |
+| `ollama_native` | `/api/chat` | `OLLAMA_NUM_CTX_DEFAULT` (32768) or `OLLAMA_NUM_CTX_{ONTOLOGY,NER,PROFILE,SIM_CONFIG,REPORT,CHAT}` per operation |
+
+- Every request is checked before sending (estimated input + output reserve ≤ `num_ctx`). A request that does not fit fails with a visible `ContextOverflowError`; nothing is truncated silently.
+- `num_ctx` is honored only by Ollama's llama.cpp runner (GGUF models). The MLX runner (e.g. `qwen3.8:*-nvfp4/mxfp8`) ignores it.
+- The simulation (CAMEL/OASIS) always uses `/v1` and cannot send `num_ctx`. Set `SIMULATION_LLM_MODEL_NAME` to the derived model above so it loads at 32768 instead of the server default. With a slow thinking model, set `SIMULATION_DISABLE_THINKING=true`.
+- Validation results, memory measurements and how to switch back to the OpenAI mode: [docs/ollama-integration-report.md](./docs/ollama-integration-report.md).
 
 ## Architecture
 
@@ -160,7 +162,7 @@ This fork introduces a clean abstraction layer between the application and the g
                │
         ┌──────▼──────┐
         │  Neo4j CE   │
-        │  5.15       │
+        │  5.18+      │
         └─────────────┘
 ```
 
@@ -169,19 +171,22 @@ This fork introduces a clean abstraction layer between the application and the g
 - `GraphStorage` is an abstract interface — swap Neo4j for any other graph DB by implementing one class
 - Dependency injection via Flask `app.extensions` — no global singletons
 - Hybrid search: 0.7 × vector similarity + 0.3 × BM25 keyword search
-- Synchronous NER/RE extraction via local LLM (replaces Zep's async episodes)
+- Synchronous NER/RE extraction via local LLM (replaces Zep's async episodes), with a JSON-schema response format built from the ontology and validated with Pydantic
+- No silent failures: embedding, NER and context errors fail the build task with the cause
 - All original dataclasses and LLM tools (InsightForge, Panorama, Agent Interviews) preserved
 
 ## Hardware Requirements
 
-| Component | Minimum | Recommended |
-|---|---|---|
-| RAM | 16 GB | 32 GB |
-| VRAM (GPU) | 10 GB (14b model) | 24 GB (32b model) |
-| Disk | 20 GB | 50 GB |
-| CPU | 4 cores | 8+ cores |
+Measured on an Apple M4 Max (64 GB) with Ollama 0.40.17:
 
-CPU-only mode works but is significantly slower for LLM inference. For lighter setups, use `qwen2.5:14b` or `qwen2.5:7b`.
+| Setup | GPU memory |
+|---|---|
+| `ornith-1.5:9b` (GGUF) at 131072 context (server default) | ~19.4 GB |
+| `ornith-1.5:9b-mirofish-ctx32k` at 32768 | ~9.9 GB |
+| Full pipeline with that model (incl. embeddings) | 9.7–13.6 GB |
+| `qwen3.8:27b` (MLX), full pipeline | 30–43 GB |
+
+CPU-only mode works but is much slower. Pick a smaller chat model if memory is tight.
 
 ## Use Cases
 
@@ -199,7 +204,8 @@ AGPL-3.0 — same as the original MiroFish project. See [LICENSE](./LICENSE).
 This is a modified fork of [MiroFish](https://github.com/666ghj/MiroFish) by [666ghj](https://github.com/666ghj), originally supported by [Shanda Group](https://www.shanda.com/). The simulation engine is powered by [OASIS](https://github.com/camel-ai/oasis) from the CAMEL-AI team.
 
 **Modifications in this fork:**
-- Backend migrated from Zep Cloud to local Neo4j CE 5.15 + Ollama
+- Backend migrated from Zep Cloud to local Neo4j CE 5.18+ + Ollama (chat, embeddings and structured NER)
+- Per-operation context window control (`ollama_native`), request preflight and visible failures
 - Entire frontend translated from Chinese to English (20 files, 1,000+ strings)
 - All Zep references replaced with Neo4j across the UI
 - Rebranded to MiroFish Offline

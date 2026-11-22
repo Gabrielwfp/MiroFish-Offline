@@ -436,7 +436,7 @@ class TwitterSimulationRunner:
         # Read configuration from .env first
         llm_api_key = os.environ.get("LLM_API_KEY", "")
         llm_base_url = os.environ.get("LLM_BASE_URL", "")
-        llm_model = os.environ.get("LLM_MODEL_NAME", "")
+        llm_model = os.environ.get("SIMULATION_LLM_MODEL_NAME") or os.environ.get("LLM_MODEL_NAME", "")
         
         # If not in .env, use config as fallback
         if not llm_model:
@@ -454,9 +454,11 @@ class TwitterSimulationRunner:
         
         print(f"LLM configuration: model={llm_model}, base_url={llm_base_url[:40] if llm_base_url else 'default'}...")
         
+        disable_thinking = os.environ.get("SIMULATION_DISABLE_THINKING", "false").lower() == "true"
         return ModelFactory.create(
             model_platform=ModelPlatformType.OPENAI,
             model_type=llm_model,
+            model_config_dict={"reasoning_effort": "none"} if disable_thinking else None,
         )
     
     def _get_active_agents_for_round(

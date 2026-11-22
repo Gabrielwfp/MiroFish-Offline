@@ -194,10 +194,14 @@ class OntologyGenerator:
         ]
 
         # Call LLM
+        # The ontology JSON is large (~10k chars); reasoning tokens from thinking
+        # models count against max_tokens and truncated it, so thinking is off here.
         result = self.llm_client.chat_json(
             messages=messages,
             temperature=0.3,
-            max_tokens=4096
+            max_tokens=8192,
+            disable_thinking=True,
+            operation="ontology",
         )
 
         # Validate and post-process

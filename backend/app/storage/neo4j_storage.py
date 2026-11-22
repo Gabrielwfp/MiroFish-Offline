@@ -199,11 +199,9 @@ class Neo4jStorage(GraphStorage):
         all_embeddings: list = []
         if all_texts_to_embed:
             logger.info(f"[add_text] Batch-embedding {len(all_texts_to_embed)} texts...")
-            try:
-                all_embeddings = self._embedding.embed_batch(all_texts_to_embed)
-            except Exception as e:
-                logger.warning(f"[add_text] Batch embedding failed, falling back to empty: {e}")
-                all_embeddings = [[] for _ in all_texts_to_embed]
+            # Fail the chunk (nothing written yet) instead of storing nodes without
+            # vectors, which would silently break vector search.
+            all_embeddings = self._embedding.embed_batch(all_texts_to_embed)
 
         entity_embeddings = all_embeddings[:len(entities)]
         relation_embeddings = all_embeddings[len(entities):]
@@ -281,9 +279,10 @@ class Neo4jStorage(GraphStorage):
                 # Add entity type label
                 if etype and etype != "Entity":
                     try:
-                        def _add_label(tx, _name_lower=ename.lower()):
+                        # Labels can't be parameters; escape backticks (Cypher rule) since etype comes from the LLM
+                        def _add_label(tx, _name_lower=ename.lower(), _label=etype.replace("`", "``")):
                             tx.run(
-                                f"MATCH (n:Entity {{graph_id: $gid, name_lower: $nl}}) SET n:`{etype}`",
+                                f"MATCH (n:Entity {{graph_id: $gid, name_lower: $nl}}) SET n:`{_label}`",
                                 gid=graph_id,
                                 nl=_name_lower,
                             )
@@ -319,19 +318,20 @@ class Neo4jStorage(GraphStorage):
                         """
                         MATCH (src:Entity {uuid: $src_uuid})
                         MATCH (tgt:Entity {uuid: $tgt_uuid})
-                        CREATE (src)-[r:RELATION {
-                            uuid: $uuid,
-                            graph_id: $gid,
-                            name: $name,
-                            fact: $fact,
-                            fact_embedding: $fact_embedding,
-                            attributes_json: '{}',
-                            episode_ids: [$episode_id],
-                            created_at: $now,
-                            valid_at: null,
-                            invalid_at: null,
-                            expired_at: null
-                        }]->(tgt)
+                        // Same fact re-extracted (overlapping chunks, repeated sentences)
+                        // reuses the edge; distinct facts between the same pair stay separate.
+                        MERGE (src)-[r:RELATION {graph_id: $gid, name: $name, fact: $fact}]->(tgt)
+                        ON CREATE SET r.uuid = $uuid,
+                                      r.fact_embedding = $fact_embedding,
+                                      r.attributes_json = '{}',
+                                      r.episode_ids = [$episode_id],
+                                      r.created_at = $now,
+                                      r.valid_at = null,
+                                      r.invalid_at = null,
+                                      r.expired_at = null
+                        ON MATCH SET r.episode_ids = CASE WHEN $episode_id IN r.episode_ids
+                                                          THEN r.episode_ids
+                                                          ELSE r.episode_ids + $episode_id END
                         """,
                         src_uuid=_source_uuid,
                         tgt_uuid=_target_uuid,

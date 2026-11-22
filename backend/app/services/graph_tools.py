@@ -402,7 +402,7 @@ class GraphToolsService:
     def llm(self) -> LLMClient:
         """Lazy initialization of LLM client"""
         if self._llm_client is None:
-            self._llm_client = LLMClient()
+            self._llm_client = LLMClient(operation="report")  # used by the report's tools
         return self._llm_client
 
     # ========== Basic Tools ==========
@@ -1373,7 +1373,10 @@ Please select up to {max_agents} most suitable Agents for interview and explain 
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=0.3
+                temperature=0.3,
+                # Agent selection is a short JSON answer; with thinking on, reasoning consumed the
+                # whole 4096-token budget in 3/3 lab runs and fell back to the default selection
+                disable_thinking=True,
             )
 
             selected_indices = response.get("selected_indices", [])[:max_agents]
@@ -1487,7 +1490,10 @@ Please generate an interview summary."""
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0.3,
-                max_tokens=800
+                # The prompt allows up to ~1000 words (~1300 tokens); 800 tokens cut every summary
+                # once thinking tokens were counted, so: larger reserve and no thinking (condensation task)
+                max_tokens=2048,
+                disable_thinking=True,
             )
             return summary
 

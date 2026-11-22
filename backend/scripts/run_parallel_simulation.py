@@ -1012,7 +1012,9 @@ def create_model(config: Dict[str, Any], use_boost: bool = False):
         # useCommon configuration
         llm_api_key = os.environ.get("LLM_API_KEY", "")
         llm_base_url = os.environ.get("LLM_BASE_URL", "")
-        llm_model = os.environ.get("LLM_MODEL_NAME", "")
+        # Simulation may use its own model, e.g. an Ollama model derived with `PARAMETER num_ctx`
+        # (CAMEL talks to the OpenAI-compatible /v1 API, which cannot send num_ctx)
+        llm_model = os.environ.get("SIMULATION_LLM_MODEL_NAME") or os.environ.get("LLM_MODEL_NAME", "")
         config_label = "[Common LLM]"
     
     # If model name is not in .env, use config as fallback
@@ -1031,9 +1033,12 @@ def create_model(config: Dict[str, Any], use_boost: bool = False):
     
     print(f"{config_label} model={llm_model}, base_url={llm_base_url[:40] if llm_base_url else 'default'}...")
     
+    # reasoning_effort is a ChatGPTConfig field that CAMEL forwards as-is; "none" turns off thinking on Ollama
+    disable_thinking = os.environ.get("SIMULATION_DISABLE_THINKING", "false").lower() == "true"
     return ModelFactory.create(
         model_platform=ModelPlatformType.OPENAI,
         model_type=llm_model,
+        model_config_dict={"reasoning_effort": "none"} if disable_thinking else None,
     )
 
 

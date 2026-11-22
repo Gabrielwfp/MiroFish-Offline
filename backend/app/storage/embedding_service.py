@@ -1,14 +1,12 @@
 """
-EmbeddingService — local embedding via Ollama API
-
-Replaces Zep Cloud's built-in embedding with local nomic-embed-text model.
-Uses Ollama's /api/embed endpoint for vector generation (768 dimensions).
+EmbeddingService — local embedding via an OpenAI-compatible /v1/embeddings endpoint
+(omlx, Ollama, ...). Vector size is Config.EMBEDDING_DIMENSIONS and is validated
+on every response, since it must match the Neo4j vector indexes.
 """
 
 import time
 import logging
 from typing import List, Optional
-from functools import lru_cache
 
 import requests
 
@@ -18,7 +16,7 @@ logger = logging.getLogger('mirofish.embedding')
 
 
 class EmbeddingService:
-    """Generate embeddings using local Ollama server."""
+    """Generate embeddings using a local OpenAI-compatible server."""
 
     def __init__(
         self,
@@ -31,7 +29,10 @@ class EmbeddingService:
         self.base_url = (base_url or Config.EMBEDDING_BASE_URL).rstrip('/')
         self.max_retries = max_retries
         self.timeout = timeout
-        self._embed_url = f"{self.base_url}/api/embed"
+        self._embed_url = f"{self.base_url}/embeddings"
+        self.dimensions = Config.EMBEDDING_DIMENSIONS
+        api_key = Config.EMBEDDING_API_KEY
+        self._headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
         # Simple in-memory cache (text -> embedding vector)
         # Using dict instead of lru_cache because lists aren't hashable
@@ -46,10 +47,10 @@ class EmbeddingService:
             text: Input text to embed
 
         Returns:
-            768-dimensional float vector
+            Float vector of length Config.EMBEDDING_DIMENSIONS
 
         Raises:
-            EmbeddingError: If Ollama request fails after retries
+            EmbeddingError: If the request fails or the response is invalid
         """
         if not text or not text.strip():
             raise EmbeddingError("Cannot embed empty text")
@@ -72,7 +73,7 @@ class EmbeddingService:
         """
         Generate embeddings for multiple texts.
 
-        Processes in batches to avoid overwhelming Ollama.
+        Processes in batches to avoid overwhelming the embedding server.
 
         Args:
             texts: List of input texts
@@ -98,7 +99,7 @@ class EmbeddingService:
                 uncached_texts.append(text)
             else:
                 # Empty text — zero vector
-                results[i] = [0.0] * 768
+                results[i] = [0.0] * self.dimensions
 
         # Batch-embed uncached texts
         if uncached_texts:
@@ -117,10 +118,10 @@ class EmbeddingService:
 
     def _request_embeddings(self, texts: List[str]) -> List[List[float]]:
         """
-        Make HTTP request to Ollama /api/embed endpoint with retry.
+        POST to {base_url}/embeddings (OpenAI format) with retry on network/5xx errors.
 
         Args:
-            texts: List of texts to embed (Ollama supports batch in single request)
+            texts: List of texts to embed in a single request
 
         Returns:
             List of embedding vectors
@@ -136,15 +137,25 @@ class EmbeddingService:
                 response = requests.post(
                     self._embed_url,
                     json=payload,
+                    headers=self._headers,
                     timeout=self.timeout,
                 )
                 response.raise_for_status()
                 data = response.json()
 
-                embeddings = data.get("embeddings", [])
+                # OpenAI format: {"data": [{"index": i, "embedding": [...]}, ...]}
+                items = sorted(data.get("data", []), key=lambda d: d.get("index", 0))
+                embeddings = [d["embedding"] for d in items]
                 if len(embeddings) != len(texts):
                     raise EmbeddingError(
                         f"Expected {len(texts)} embeddings, got {len(embeddings)}"
+                    )
+                # A wrong size would be rejected by (or silently mismatch) the Neo4j vector index
+                bad = next((len(v) for v in embeddings if len(v) != self.dimensions), None)
+                if bad is not None:
+                    raise EmbeddingError(
+                        f"Model '{self.model}' returned {bad}-dim vectors but "
+                        f"EMBEDDING_DIMENSIONS={self.dimensions}"
                     )
 
                 return embeddings
@@ -152,24 +163,26 @@ class EmbeddingService:
             except requests.exceptions.ConnectionError as e:
                 last_error = e
                 logger.warning(
-                    f"Ollama connection failed (attempt {attempt + 1}/{self.max_retries}): {e}"
+                    f"Embedding server connection failed (attempt {attempt + 1}/{self.max_retries}): {e}"
                 )
             except requests.exceptions.Timeout as e:
                 last_error = e
                 logger.warning(
-                    f"Ollama request timed out (attempt {attempt + 1}/{self.max_retries})"
+                    f"Embedding request timed out (attempt {attempt + 1}/{self.max_retries})"
                 )
             except requests.exceptions.HTTPError as e:
                 last_error = e
-                logger.error(f"Ollama HTTP error: {e.response.status_code} - {e.response.text}")
+                logger.error(f"Embedding HTTP error: {e.response.status_code} - {e.response.text[:500]}")
                 if e.response.status_code >= 500:
                     # Server error — retry
                     pass
                 else:
-                    # Client error (4xx) — don't retry
-                    raise EmbeddingError(f"Ollama embedding failed: {e}") from e
-            except (KeyError, ValueError) as e:
-                raise EmbeddingError(f"Invalid Ollama response: {e}") from e
+                    # Client error (4xx: auth, unknown/non-embedding model) — don't retry
+                    raise EmbeddingError(
+                        f"Embedding request failed ({e.response.status_code}): {e.response.text[:500]}"
+                    ) from e
+            except (KeyError, ValueError, TypeError, AttributeError) as e:
+                raise EmbeddingError(f"Invalid embedding response: {e}") from e
 
             # Exponential backoff
             if attempt < self.max_retries - 1:
@@ -178,7 +191,7 @@ class EmbeddingService:
                 time.sleep(wait)
 
         raise EmbeddingError(
-            f"Ollama embedding failed after {self.max_retries} retries: {last_error}"
+            f"Embedding failed after {self.max_retries} retries: {last_error}"
         )
 
     def _cache_put(self, text: str, vector: List[float]) -> None:
@@ -191,7 +204,7 @@ class EmbeddingService:
         self._cache[text] = vector
 
     def health_check(self) -> bool:
-        """Check if Ollama embedding endpoint is reachable."""
+        """Check if the embedding endpoint is reachable."""
         try:
             vec = self.embed("health check")
             return len(vec) > 0

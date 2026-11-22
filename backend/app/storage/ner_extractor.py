@@ -2,16 +2,56 @@
 NER/RE Extractor — entity and relation extraction via local LLM
 
 Replaces Zep Cloud's built-in NER/RE pipeline.
-Uses LLMClient.chat_json() with a structured prompt to extract
-entities and relations from text chunks, guided by the graph's ontology.
+Uses LLMClient.chat_json() with a JSON Schema built from the graph's ontology
+(enforced by Ollama's structured outputs) and validates every response against
+the NERResult contract. Failures raise NERExtractionError instead of silently
+returning an empty extraction.
 """
 
 import logging
 from typing import Dict, Any, List, Optional
 
-from ..utils.llm_client import LLMClient
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+from ..utils.llm_client import ContextOverflowError, LLMClient
 
 logger = logging.getLogger('mirofish.ner_extractor')
+
+
+class NERExtractionError(RuntimeError):
+    """Raised when the LLM cannot produce a contract-compliant extraction."""
+
+
+# --- Response contract -------------------------------------------------------
+
+class ExtractedEntity(BaseModel):
+    name: str = Field(min_length=1)
+    type: str = Field(min_length=1)
+    attributes: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ExtractedRelation(BaseModel):
+    source: str = Field(min_length=1)
+    target: str = Field(min_length=1)
+    type: str = Field(min_length=1)
+    fact: str = ""
+
+
+class NERResult(BaseModel):
+    # Unknown top-level keys (e.g. "relationships" instead of "relations") are a contract violation
+    model_config = ConfigDict(extra="forbid")
+    entities: List[ExtractedEntity]
+    relations: List[ExtractedRelation]
+
+
+def _type_names(items: List[Any]) -> List[str]:
+    """Names of ontology entity/relation types (items may be dicts or plain strings)."""
+    names = []
+    for it in items or []:
+        name = (it.get("name", "") if isinstance(it, dict) else str(it)).strip()
+        if name and name not in names:
+            names.append(name)
+    return names
 
 # System prompt template for NER/RE extraction
 _SYSTEM_PROMPT = """You are a Named Entity Recognition and Relation Extraction system.
@@ -64,6 +104,11 @@ class NERExtractor:
                 "entities": [{"name": str, "type": str, "attributes": dict}],
                 "relations": [{"source": str, "target": str, "type": str, "fact": str}]
             }
+            Empty lists only when the model validly found nothing.
+
+        Raises:
+            NERExtractionError: if no contract-compliant response is obtained
+                within max_retries + 1 attempts.
         """
         if not text or not text.strip():
             return {"entities": [], "relations": []}
@@ -77,31 +122,80 @@ class NERExtractor:
             {"role": "user", "content": user_msg},
         ]
 
-        last_error = None
-        for attempt in range(self.max_retries + 1):
+        schema = self._build_schema(ontology)
+        attempts = self.max_retries + 1
+        last_error: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
             try:
-                result = self.llm.chat_json(
+                raw = self.llm.chat_json(
                     messages=messages,
                     temperature=0.1,  # Low temp for extraction precision
                     max_tokens=4096,
+                    schema=schema,
+                    disable_thinking=True,
+                    operation="ner",
                 )
-                return self._validate_and_clean(result, ontology)
+                result = NERResult.model_validate(raw)
+                return self._validate_and_clean(result.model_dump(), ontology)
 
-            except ValueError as e:
+            except ContextOverflowError as e:  # retrying cannot help; fail the chunk visibly
+                raise NERExtractionError(f"NER chunk does not fit the context window: {e}") from e
+            except ValidationError as e:  # must precede ValueError (it subclasses it)
                 last_error = e
                 logger.warning(
-                    f"NER extraction failed (attempt {attempt + 1}): invalid JSON — {e}"
+                    f"NER response violates contract (attempt {attempt}/{attempts}): {str(e)[:500]}"
                 )
+            except ValueError as e:
+                last_error = e
+                logger.warning(f"NER returned invalid JSON (attempt {attempt}/{attempts}): {str(e)[:500]}")
             except Exception as e:
                 last_error = e
-                logger.error(f"NER extraction error: {e}")
-                if attempt >= self.max_retries:
-                    break
+                logger.error(f"NER LLM call failed (attempt {attempt}/{attempts}): {e}")
 
-        logger.error(
-            f"NER extraction failed after {self.max_retries + 1} attempts: {last_error}"
+        raise NERExtractionError(
+            f"NER extraction failed after {attempts} attempts "
+            f"(model={self.llm.model}): {str(last_error)[:500]}"
         )
-        return {"entities": [], "relations": []}
+
+    def _build_schema(self, ontology: Dict[str, Any]) -> Dict[str, Any]:
+        """JSON Schema for the NERResult contract; ontology types become enums."""
+        entity_types = _type_names(ontology.get("entity_types", []))
+        relation_types = _type_names(ontology.get("relation_types", ontology.get("edge_types", [])))
+
+        def type_field(names: List[str]) -> Dict[str, Any]:
+            return {"type": "string", "enum": names} if names else {"type": "string"}
+
+        return {
+            "type": "object",
+            "properties": {
+                "entities": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "type": type_field(entity_types),
+                            "attributes": {"type": "object", "additionalProperties": {"type": "string"}},
+                        },
+                        "required": ["name", "type", "attributes"],
+                    },
+                },
+                "relations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "source": {"type": "string"},
+                            "target": {"type": "string"},
+                            "type": type_field(relation_types),
+                            "fact": {"type": "string"},
+                        },
+                        "required": ["source", "target", "type", "fact"],
+                    },
+                },
+            },
+            "required": ["entities", "relations"],
+        }
 
     def _format_ontology(self, ontology: Dict[str, Any]) -> str:
         """Format ontology dict into readable text for the LLM prompt."""
@@ -156,19 +250,7 @@ class NERExtractor:
         relations = result.get("relations", [])
 
         # Get valid type names from ontology
-        valid_entity_types = set()
-        for et in ontology.get("entity_types", []):
-            if isinstance(et, dict):
-                valid_entity_types.add(et.get("name", "").strip())
-            else:
-                valid_entity_types.add(str(et).strip())
-
-        valid_relation_types = set()
-        for rt in ontology.get("relation_types", ontology.get("edge_types", [])):
-            if isinstance(rt, dict):
-                valid_relation_types.add(rt.get("name", "").strip())
-            else:
-                valid_relation_types.add(str(rt).strip())
+        valid_entity_types = set(_type_names(ontology.get("entity_types", [])))
 
         # Clean entities
         cleaned_entities = []
